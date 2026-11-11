@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
 import re
-from youtube_transcript_api import YouTubeTranscriptApi
-from google import genai
 import json
+import os
+import yt_dlp
+from google import genai
 from io import BytesIO
 
 st.set_page_config(page_title="Monitor de Falas - Michel Saad", layout="wide")
@@ -29,6 +30,62 @@ def segundos_para_hhmmss(segundos):
     s = segundos % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+def obter_transcricao_ytdlp(url_video):
+    """Extrai legendas/transcrição usando yt-dlp para contornar bloqueios de IP na nuvem"""
+    ydl_opts = {
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['pt', 'pt-BR'],
+        'outtmpl': 'temp_sub',
+    }
+    
+    transcript_text = ""
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url_video, download=False)
+            
+        # Tenta extrair legendas automáticas ou manuais disponíveis no infodict
+        subtitles = info.get('requested_subtitles') or info.get('automatic_captions', {}).get('pt')
+        if not subtitles:
+            # Tenta buscar por chaves em português
+            for lang in ['pt', 'pt-BR', 'pt-en']:
+                if lang in info.get('automatic_captions', {}):
+                    subtitles = info['automatic_captions'][lang]
+                    break
+                    
+        # Se encontrou dados de legendas estruturadas (json3 ou vtt)
+        if subtitles:
+            # Vamos baixar o arquivo de legenda real para processar
+            ydl_opts_download = {
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': ['pt', 'pt-BR'],
+                'subtitlesformat': 'vtt',
+                'outtmpl': 'temp_sub',
+            }
+            with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
+                ydl.download([url_video])
+                
+            # Procurar pelo arquivo .vtt baixado
+            for arquivo in os.listdir('.'):
+                if arquivo.startswith('temp_sub') and arquivo.endswith('.vtt'):
+                    with open(arquivo, 'r', encoding='utf-8') as f:
+                        transcript_text = f.read()
+                    os.remove(arquivo) # Limpa o arquivo temporário
+                    break
+        
+        if not transcript_text:
+            # Fallback: Se não conseguiu o arquivo vtt, usa a descrição do vídeo ou metadados combinados
+            description = info.get('description', '')
+            title = info.get('title', '')
+            transcript_text = f"Título: {title}\nDescrição:\n{description}"
+            
+        return transcript_text
+    except Exception as e:
+        raise Exception(f"Erro no yt-dlp: {str(e)}")
+
 url_video = st.text_input("URL do Vídeo do YouTube:", placeholder="https://www.youtube.com/watch?v=haWDPmx5Kkw")
 
 if st.button("Analisar Sessão", type="primary"):
@@ -37,20 +94,13 @@ if st.button("Analisar Sessão", type="primary"):
     elif not gemini_api_key:
         st.error("Chave da API do Gemini não configurada.")
     else:
-        video_id = extrair_video_id(url_video)
+        video_id = extrair_video_id(url_url := url_video)
         if not video_id:
             st.error("URL do YouTube inválida.")
         else:
-            with st.spinner("Extraindo transcrição do vídeo..."):
+            with st.spinner("Extraindo transcrição e metadados com yt-dlp..."):
                 try:
-                    # Instancia e busca a transcrição
-                    ytt_api = YouTubeTranscriptApi()
-                    transcript = ytt_api.fetch(video_id, languages=['pt', 'pt-BR'])
-                    
-                    texto_com_tempo = ""
-                    for item in transcript:
-                        t_str = segundos_para_hhmmss(item.start)
-                        texto_com_tempo += f"[{t_str}] (segundos: {int(item.start)}) {item.text}\n"
+                    texto_com_tempo = obter_transcricao_ytdlp(url_video)
                 except Exception as e:
                     st.error(f"Erro ao extrair transcrição: {e}")
                     st.stop()
@@ -60,16 +110,16 @@ if st.button("Analisar Sessão", type="primary"):
                     client = genai.Client(api_key=gemini_api_key)
                     prompt = f"""
                     Você é um analista legislativo especialista em monitoramento político.
-                    Analise a transcrição de sessão plenária abaixo.
+                    Analise o texto/transcrição da sessão plenária abaixo.
                     Identifique todas as intervenções, discursos, apartes ou menções referentes ao vereador Michel Saad (ou falas dele).
                     Retorne estritamente um array JSON de objetos, onde cada objeto tem:
                     - "data": Data da sessão (infira pelo contexto/transcrição se houver, ou use formato DD/MM/AAAA)
                     - "quem_falou": Nome do orador ou quem fez a menção (ex: 'Michel Saad', 'Daniel Marques', 'Douglas Gomes')
-                    - "tempo_segundos": número inteiro com o segundo inicial exato do vídeo
+                    - "tempo_segundos": número inteiro com o segundo inicial aproximado ou exato do vídeo (se houver marcação, caso contrário estime com base no texto)
                     - "tempo_hhmmss": texto no formato 'HH:MM:SS'
                     - "assunto": resumo claro, conciso e objetivo da fala ou menção
 
-                    Transcrição:
+                    Texto/Transcrição:
                     {texto_com_tempo[:90000]}
                     """
 
